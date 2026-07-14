@@ -25,6 +25,10 @@ struct StreamRecommendationInfo {
     bool    enable_cross_sequence_ban      = false;
     int32_t cross_seq_diverge_start_combo = 0;
     int32_t cross_seq_diverge_layer       = 0;
+    // diverge 逻辑必须显式排除 EOS/结束 token：否则主序列(i=0)贪心选中 EOS 时会被塞进
+    // chosen_tokens，导致后续序列在应该停止的位置被误遮蔽 EOS，无法正常结束生成。
+    // -1 表示未知/不校验（兼容旧调用点）。
+    int64_t eos_token_id = -1;
 
     // 当前正在生成 combo 内的位置,取值 [0, combo_token_size-1]
     int32_t pos_in_combo = 0;
@@ -51,7 +55,8 @@ struct StreamRecommendationInfo {
                              const std::vector<int>&           end_think_token_ids = {},
                              bool                              enable_cross_sequence_ban = false,
                              int32_t                           cross_seq_diverge_start_combo = 0,
-                             int32_t                           cross_seq_diverge_layer = 0):
+                             int32_t                           cross_seq_diverge_layer = 0,
+                             int64_t                           eos_token_id = -1):
         combo_token_size(combo_token_size),
         input_length(input_length),
         current_output_length(current_output_length),
@@ -59,6 +64,7 @@ struct StreamRecommendationInfo {
         enable_cross_sequence_ban(enable_cross_sequence_ban),
         cross_seq_diverge_start_combo(cross_seq_diverge_start_combo),
         cross_seq_diverge_layer(cross_seq_diverge_layer),
+        eos_token_id(eos_token_id),
         banned_combos(banned_combos),
         end_think_token_ids(end_think_token_ids),
         think_done(end_think_token_ids.empty()) {}
@@ -79,7 +85,7 @@ public:
 public:
     // 若 generate_config.combo_token_size <= 0 则返回 nullptr(未启用该功能)。
     static std::shared_ptr<RecommendationLogitsProcessor>
-    fromGenerateInput(std::shared_ptr<GenerateInput> generate_input, int32_t num);
+    fromGenerateInput(std::shared_ptr<GenerateInput> generate_input, int32_t num, int64_t eos_token_id = -1);
 
 public:
     void process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx) override;
@@ -117,6 +123,9 @@ public:
                 RTP_LLM_CHECK_WITH_INFO(
                     existing.end_think_token_ids == incoming.end_think_token_ids,
                     "insert: end_think_token_ids mismatch");
+                RTP_LLM_CHECK_WITH_INFO(
+                    existing.eos_token_id == incoming.eos_token_id,
+                    "insert: eos_token_id mismatch");
             }
             infos_.insert(infos_.end(), others->infos_.begin(), others->infos_.end());
         }

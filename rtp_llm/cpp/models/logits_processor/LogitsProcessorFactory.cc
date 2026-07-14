@@ -29,7 +29,7 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
     }
 
     // 生成式推荐：combo 粒度去重 + 曝光过滤
-    auto rec_processor = RecommendationLogitsProcessor::fromGenerateInput(generate_input, init_batch_size);
+    auto rec_processor = RecommendationLogitsProcessor::fromGenerateInput(generate_input, init_batch_size, eos_token_id);
     if (rec_processor != nullptr) {
         result.push_back(std::static_pointer_cast<BaseLogitsProcessor>(rec_processor));
     }

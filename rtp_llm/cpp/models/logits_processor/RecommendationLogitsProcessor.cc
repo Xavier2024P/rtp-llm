@@ -30,7 +30,7 @@ RecommendationLogitsProcessor::RecommendationLogitsProcessor(std::vector<StreamR
     infos_(std::move(infos)) {}
 
 std::shared_ptr<RecommendationLogitsProcessor>
-RecommendationLogitsProcessor::fromGenerateInput(std::shared_ptr<GenerateInput> generate_input, int32_t num) {
+RecommendationLogitsProcessor::fromGenerateInput(std::shared_ptr<GenerateInput> generate_input, int32_t num, int64_t eos_token_id) {
     const auto& config = generate_input->generate_config;
     if (config->combo_token_size <= 0) {
         return nullptr;
@@ -119,7 +119,8 @@ RecommendationLogitsProcessor::fromGenerateInput(std::shared_ptr<GenerateInput> 
                                       end_think_token_ids,
                                       enable_cross_seq_ban,
                                       diverge_start_combo,
-                                      diverge_layer);
+                                      diverge_layer,
+                                      eos_token_id);
         processor_ptr->infos_.push_back(std::move(info));
     }
     return processor_ptr;
@@ -229,6 +230,25 @@ void RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t 
             const bool qualifies_for_mask = i > 0 && info.enable_cross_sequence_ban && info.think_done
                                             && info.completed_combo_count >= info.cross_seq_diverge_start_combo;
             auto row = logits[i];
+
+            // TEMP DEBUG(diverge-layer0-diagnosis): 打印 mask 前 top-5 原始 logits，用于排查
+            // row2/3/4 类目锁死是「上下文没有正确推进」还是「模型自身在该上下文下收窄」。
+            // 验证结论后必须删除本段日志，不得带入正式版本。
+            if (info.pos_in_combo == 0) {
+                const int64_t topk_n = std::min<int64_t>(5, static_cast<int64_t>(vocab_size));
+                auto topk_result  = torch::topk(row, topk_n);
+                auto topk_values  = std::get<0>(topk_result).to(torch::kCPU);
+                auto topk_indices = std::get<1>(topk_result).to(torch::kCPU);
+                std::string topk_str;
+                for (int64_t k = 0; k < topk_n; ++k) {
+                    topk_str += std::to_string(topk_indices[k].item<int64_t>()) + ":"
+                                + std::to_string(topk_values[k].item<float>()) + " ";
+                }
+                RTP_LLM_LOG_INFO(
+                    "[TEMP DEBUG diverge-diagnosis] row=%zu completed_combo=%d pos=%d top5(id:logit)=%s",
+                    i, info.completed_combo_count, info.pos_in_combo, topk_str.c_str());
+            }
+
             if (qualifies_for_mask && !chosen_tokens.empty()) {
                 const int64_t remaining = torch::isfinite(row).sum().item<int64_t>();
                 std::vector<int64_t> mask_tokens;
@@ -255,8 +275,13 @@ void RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t 
             }
             // 只有 think 完成的行才贡献 greedy 选择；think 未完成的行生成的是
             // think prelude token，不应作为 combo 分叉的避让依据。
+            // 显式排除 EOS：EOS 不应作为「需要被后续行避让」的候选，否则会导致
+            // 主序列贪心选中 EOS 时，后续序列在应停止的位置被误遮蔽 EOS，无法正常结束生成。
             if (info.think_done) {
-                chosen_tokens.push_back(row.argmax().item<int64_t>());
+                const int64_t greedy_tok = row.argmax().item<int64_t>();
+                if (!(info.eos_token_id >= 0 && greedy_tok == info.eos_token_id)) {
+                    chosen_tokens.push_back(greedy_tok);
+                }
             }
         }
     }
