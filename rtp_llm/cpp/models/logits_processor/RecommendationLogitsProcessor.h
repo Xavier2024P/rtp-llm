@@ -22,8 +22,9 @@ struct StreamRecommendationInfo {
     int32_t current_output_length     = 0;
     // 兼容旧构造/insert一致性检查的遗留字段；实际 token layout 由 updateStatus 按 new_tokens shape 动态判定。
     bool    needs_token_offset        = false;
-    bool    enable_cross_sequence_ban = false;
+    bool    enable_cross_sequence_ban      = false;
     int32_t cross_seq_diverge_start_combo = 0;
+    int32_t cross_seq_diverge_layer       = 0;
 
     // 当前正在生成 combo 内的位置,取值 [0, combo_token_size-1]
     int32_t pos_in_combo = 0;
@@ -49,13 +50,15 @@ struct StreamRecommendationInfo {
                              const std::set<std::vector<int>>& banned_combos,
                              const std::vector<int>&           end_think_token_ids = {},
                              bool                              enable_cross_sequence_ban = false,
-                             int32_t                           cross_seq_diverge_start_combo = 0):
+                             int32_t                           cross_seq_diverge_start_combo = 0,
+                             int32_t                           cross_seq_diverge_layer = 0):
         combo_token_size(combo_token_size),
         input_length(input_length),
         current_output_length(current_output_length),
         needs_token_offset(needs_token_offset),
         enable_cross_sequence_ban(enable_cross_sequence_ban),
         cross_seq_diverge_start_combo(cross_seq_diverge_start_combo),
+        cross_seq_diverge_layer(cross_seq_diverge_layer),
         banned_combos(banned_combos),
         end_think_token_ids(end_think_token_ids),
         think_done(end_think_token_ids.empty()) {}
@@ -105,6 +108,9 @@ public:
                 RTP_LLM_CHECK_WITH_INFO(
                     existing.cross_seq_diverge_start_combo == incoming.cross_seq_diverge_start_combo,
                     "insert: cross_seq_diverge_start_combo mismatch");
+                RTP_LLM_CHECK_WITH_INFO(
+                    existing.cross_seq_diverge_layer == incoming.cross_seq_diverge_layer,
+                    "insert: cross_seq_diverge_layer mismatch");
                 RTP_LLM_CHECK_WITH_INFO(
                     existing.needs_token_offset == incoming.needs_token_offset,
                     "insert: legacy needs_token_offset flag mismatch");

@@ -105,6 +105,48 @@ class TestClampDivergeStartCombo(unittest.TestCase):
         self.assertEqual(cfg.cross_seq_diverge_start_combo, 100)
 
 
+class TestClampDivergeLayer(unittest.TestCase):
+
+    def setUp(self):
+        _reset_sanitize_warn_state()
+
+    def test_default_layer_zero(self):
+        cfg = GenerateConfig()
+        self.assertEqual(cfg.cross_seq_diverge_layer, 0)
+
+    def test_negative_layer_clamped_to_zero(self):
+        with self.assertLogs(level=logging.WARNING) as cm:
+            cfg = GenerateConfig(cross_seq_diverge_layer=-1)
+        self.assertEqual(cfg.cross_seq_diverge_layer, 0)
+        self.assertTrue(any("cross_seq_diverge_layer" in msg and "negative" in msg for msg in cm.output))
+
+    def test_non_integer_layer_defaults_to_zero(self):
+        with self.assertLogs(level=logging.WARNING) as cm:
+            cfg = GenerateConfig(cross_seq_diverge_layer="abc")
+        self.assertEqual(cfg.cross_seq_diverge_layer, 0)
+        self.assertTrue(any("cross_seq_diverge_layer" in msg and "non-integer" in msg for msg in cm.output))
+
+    def test_layer_clamped_to_combo_size(self):
+        with self.assertLogs(level=logging.WARNING) as cm:
+            cfg = GenerateConfig(combo_token_size=3, cross_seq_diverge_layer=9)
+        self.assertEqual(cfg.cross_seq_diverge_layer, 2)
+        self.assertTrue(any("combo_token_size-1" in msg for msg in cm.output))
+
+    def test_update_clamps_layer_when_combo_size_changes(self):
+        cfg = GenerateConfig(combo_token_size=5, cross_seq_diverge_layer=4)
+        self.assertEqual(cfg.cross_seq_diverge_layer, 4)
+        with self.assertLogs(level=logging.WARNING):
+            cfg.update({"combo_token_size": 3})
+        self.assertEqual(cfg.cross_seq_diverge_layer, 2)
+
+    def test_update_and_pop_clamps_layer(self):
+        cfg = GenerateConfig(combo_token_size=3)
+        with self.assertLogs(level=logging.WARNING):
+            remaining = cfg.update_and_pop({"cross_seq_diverge_layer": 10})
+        self.assertEqual(cfg.cross_seq_diverge_layer, 2)
+        self.assertNotIn("cross_seq_diverge_layer", remaining)
+
+
 class TestCrossSeqBanCompatibility(unittest.TestCase):
     """测试 enable_cross_sequence_ban 与 beam search / combo_token_size 的互斥校验。"""
 

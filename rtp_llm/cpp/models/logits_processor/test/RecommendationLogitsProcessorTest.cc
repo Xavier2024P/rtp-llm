@@ -1,5 +1,9 @@
 #include "gtest/gtest.h"
 
+#include <cmath>
+#include <set>
+#include <vector>
+
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorStates.h"
 #include "rtp_llm/cpp/models/logits_processor/RecommendationLogitsProcessor.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
@@ -255,7 +259,7 @@ TEST_F(RecommendationLogitsProcessorTest, testCrossSequenceBanDisabled) {
     EXPECT_FALSE(processor->infos()[1].banned_combos.count({1, 2, 3}));
 }
 
-// 场景 10：top-K 分叉遮蔽——非主序列在 combo 起始位置被遮蔽 top-i
+// 场景 10：sequential greedy 分叉——非主序列避开前序行已选择 token
 TEST_F(RecommendationLogitsProcessorTest, testTopKDivergeMasking) {
     // 3 条序列，combo_token_size=3，开启跨序列去重，diverge_start_combo=0
     std::vector<StreamRecommendationInfo> infos;
@@ -290,6 +294,60 @@ TEST_F(RecommendationLogitsProcessorTest, testTopKDivergeMasking) {
     // 序列 2：遮蔽 top-1,2 (col1, col3)，两者应为 -inf
     EXPECT_TRUE(std::isinf(result[2][1].item<float>()) && result[2][1].item<float>() < 0);
     EXPECT_TRUE(std::isinf(result[2][3].item<float>()) && result[2][3].item<float>() < 0);
+}
+
+// 场景 10b：窄候选保护——当前行只剩一个合法候选时不遮蔽，避免全 -inf
+TEST_F(RecommendationLogitsProcessorTest, testSequentialDivergeKeepsOnlyLegalCandidate) {
+    std::vector<StreamRecommendationInfo> infos;
+    std::set<std::vector<int>> empty_set;
+    infos.push_back(StreamRecommendationInfo(3, 0, 0, false, empty_set, {}, true, 0));
+    infos.push_back(StreamRecommendationInfo(3, 0, 0, false, empty_set, {}, true, 0));
+    auto processor = std::make_shared<RecommendationLogitsProcessor>(infos);
+
+    const size_t vocab_size = 5;
+    auto sampler_inputs = allocateSamplerInputs(2, vocab_size, processor);
+    auto logits_cpu = torch::tensor({{1.0f, 5.0f, 3.0f, 4.0f, 2.0f},
+                                      {-INFINITY, 5.0f, -INFINITY, -INFINITY, -INFINITY}});
+    sampler_inputs.logits.copy_(logits_cpu);
+
+    processor->process(sampler_inputs, 0, 2);
+
+    auto result = sampler_inputs.logits.cpu();
+    EXPECT_FLOAT_EQ(5.0f, result[1][1].item<float>());
+}
+
+// 场景 10c：cross_seq_diverge_layer 控制分叉层级
+TEST_F(RecommendationLogitsProcessorTest, testDivergeLayerConfig) {
+    std::set<std::vector<int>> empty_set;
+    const size_t vocab_size = 5;
+
+    std::vector<StreamRecommendationInfo> layer0_infos;
+    layer0_infos.push_back(StreamRecommendationInfo(3, 0, 0, false, empty_set, {}, true, 0, 1));
+    layer0_infos.push_back(StreamRecommendationInfo(3, 0, 0, false, empty_set, {}, true, 0, 1));
+    auto layer0_processor = std::make_shared<RecommendationLogitsProcessor>(layer0_infos);
+    auto layer0_inputs = allocateSamplerInputs(2, vocab_size, layer0_processor);
+    layer0_inputs.logits.copy_(torch::tensor({{1.0f, 5.0f, 3.0f, 4.0f, 2.0f},
+                                              {1.0f, 5.0f, 3.0f, 4.0f, 2.0f}}));
+    layer0_processor->process(layer0_inputs, 0, 2);
+    auto layer0_result = layer0_inputs.logits.cpu();
+    EXPECT_FLOAT_EQ(5.0f, layer0_result[1][1].item<float>());
+
+    std::vector<StreamRecommendationInfo> layer1_infos;
+    auto info0 = StreamRecommendationInfo(3, 0, 0, false, empty_set, {}, true, 0, 1);
+    auto info1 = StreamRecommendationInfo(3, 0, 0, false, empty_set, {}, true, 0, 1);
+    info0.pos_in_combo = 1;
+    info0.current_prefix = {10};
+    info1.pos_in_combo = 1;
+    info1.current_prefix = {10};
+    layer1_infos.push_back(info0);
+    layer1_infos.push_back(info1);
+    auto layer1_processor = std::make_shared<RecommendationLogitsProcessor>(layer1_infos);
+    auto layer1_inputs = allocateSamplerInputs(2, vocab_size, layer1_processor);
+    layer1_inputs.logits.copy_(torch::tensor({{1.0f, 5.0f, 3.0f, 4.0f, 2.0f},
+                                              {1.0f, 5.0f, 3.0f, 4.0f, 2.0f}}));
+    layer1_processor->process(layer1_inputs, 0, 2);
+    auto layer1_result = layer1_inputs.logits.cpu();
+    EXPECT_TRUE(std::isinf(layer1_result[1][1].item<float>()) && layer1_result[1][1].item<float>() < 0);
 }
 
 // 场景 11：diverge_start_combo 延迟分叉——前 N 个商品不遮蔽
@@ -397,7 +455,7 @@ TEST_F(RecommendationLogitsProcessorTest, testDivergeAndBanSimultaneous) {
         EXPECT_FLOAT_EQ(1.0f, data0[j]);
     }
 
-    // 序列 1：diverge 遮蔽 top-1（所有值都是 1.0，topk 选出第一个），应有恰好 1 个位置被置为 -inf
+    // 序列 1：diverge 遮蔽前序行选择（所有值都是 1.0，argmax 选出第一个），应有恰好 1 个位置被置为 -inf
     int inf_count_seq1 = 0;
     for (size_t j = 0; j < vocab_size; ++j) {
         if (std::isinf(data1[j]) && data1[j] < 0) inf_count_seq1++;
@@ -449,6 +507,7 @@ TEST_F(RecommendationLogitsProcessorTest, testFromGenerateInputProductionPath) {
     generate_input->generate_config->num_return_sequences          = 3;
     generate_input->generate_config->enable_cross_sequence_ban     = true;
     generate_input->generate_config->cross_seq_diverge_start_combo = 0;
+    generate_input->generate_config->cross_seq_diverge_layer       = 99;
     generate_input->generate_config->banned_combo_token_ids        = {};
     generate_input->input_ids = torch::zeros({4}, torch::kInt32);  // input_length=4
 
@@ -459,6 +518,7 @@ TEST_F(RecommendationLogitsProcessorTest, testFromGenerateInputProductionPath) {
     for (const auto& info : p->infos()) {
         EXPECT_FALSE(info.needs_token_offset);
         EXPECT_TRUE(info.enable_cross_sequence_ban);
+        EXPECT_EQ(2, info.cross_seq_diverge_layer);
         EXPECT_EQ(4, info.input_length);
     }
 
@@ -592,7 +652,7 @@ TEST_F(RecommendationLogitsProcessorTest, testDynamicTokenLayoutBeforeAndAfterBe
     EXPECT_TRUE(p->infos()[1].banned_combos.count({10, 21}));
 }
 
-// 场景 18：top-K 遮蔽深度上界保护 —— num_return_sequences=12 时，序列 11 的遮蔽深度
+// 场景 18：sequential greedy 遮蔽深度上界保护 —— num_return_sequences=12 时，序列 11 的遮蔽深度
 // 应被 kMaxDivergeDepth(=8) 钳制，至少保留足够可选 token
 TEST_F(RecommendationLogitsProcessorTest, testDivergeDepthCappedByMaxLimit) {
     const int N = 12;  // 超过 kMaxDivergeDepth=8
@@ -883,7 +943,7 @@ TEST_F(RecommendationLogitsProcessorTest, testThinkModeSkipsDiverge) {
     const size_t vocab_size = 10;
     const int combo_size = 2;
     std::set<std::vector<int>> banned = {};
-    // end_think_token_ids = {7, 8}，think 完成前不应遮蔽 topk
+    // end_think_token_ids = {7, 8}，think 完成前不应遮蔽
     std::vector<int> end_think = {7, 8};
 
     std::vector<StreamRecommendationInfo> infos;
@@ -927,24 +987,68 @@ TEST_F(RecommendationLogitsProcessorTest, testThinkModeSkipsDiverge) {
     EXPECT_FLOAT_EQ(-std::numeric_limits<float>::infinity(), acc[1][0]);
 }
 
+// 场景 23b：think 未完成的主序列 token 不应污染 chosen_tokens，
+// 防止 think 已完成的非主序列去 mask 一个 think-phase token。
+TEST_F(RecommendationLogitsProcessorTest, testThinkDoneGuardOnChosenTokens) {
+    // 2 条序列，combo_size=2，end_think=[7,8]
+    // 构造：row 0 think_done=false，row 1 think_done=true（已完成 think）
+    const int N = 2;
+    const size_t vocab_size = 5;
+    const int combo_size = 2;
+    std::vector<int> end_think = {7, 8};
+    std::set<std::vector<int>> empty_set;
+
+    // row 0: think_done=false（未匹配 end_think 序列）
+    StreamRecommendationInfo info0(combo_size, 0, 0, false, empty_set, end_think,
+                                   /*enable_cross_sequence_ban=*/true,
+                                   /*cross_seq_diverge_start_combo=*/0);
+    // row 1: 手动设为 think_done=true 模拟异步完成
+    StreamRecommendationInfo info1(combo_size, 0, 0, false, empty_set, end_think,
+                                   /*enable_cross_sequence_ban=*/true,
+                                   /*cross_seq_diverge_start_combo=*/0);
+    info1.think_done = true;
+
+    auto processor = std::make_shared<RecommendationLogitsProcessor>(
+        std::vector<StreamRecommendationInfo>{info0, info1});
+
+    auto inputs = allocateSamplerInputs(N, vocab_size, processor);
+    // row 0（think 未完成）：col 3 最高（100）→ argmax = 3
+    auto logits_cpu = torch::tensor({{1.0f, 1.0f, 1.0f, 100.0f, 1.0f},
+                                      {1.0f, 1.0f, 1.0f,   1.0f, 1.0f}});
+    inputs.logits.copy_(logits_cpu);
+
+    processor->process(inputs, 0, N);
+
+    auto result = inputs.logits.cpu();
+    // row 1（think 完成）：chosen_tokens 应为空（row 0 think 未完成，不贡献）
+    // → 无任何位置被遮蔽，col 3 应保持原值 1.0
+    EXPECT_FLOAT_EQ(1.0f, result[1][3].item<float>());
+    // 其他位置也不受影响
+    for (size_t j = 0; j < vocab_size; ++j) {
+        EXPECT_FALSE(std::isinf(result[1][j].item<float>()))
+            << "col " << j << " should not be -inf";
+    }
+}
+
 // 场景 24：多流合批路径——start_idx > 0 时 diverge 和 ban 都正确工作
 TEST_F(RecommendationLogitsProcessorTest, testProcessWithNonZeroStartIdx) {
-    // 模拟生产链路：全局 logits 张量有 5 行，本 Processor 占 row 2~4 (start_idx=2, finish_idx=5)
-    const size_t global_batch = 5;
+    // 模拟生产链路：全局 logits 张量有 6 行，本 Processor 占 row 2~5 (start_idx=2, finish_idx=6)
+    const size_t global_batch = 6;
     const size_t vocab_size   = 6;
-    const size_t proc_batch   = 3;  // 本 processor 的 batch
+    const size_t proc_batch   = 4;  // 本 processor 的 batch
     const size_t start_idx    = 2;
 
-    // 3 条序列，combo_token_size=3，开启 cross_seq_ban，diverge_start=0
+    // 4 条序列，combo_token_size=3，开启 cross_seq_ban，diverge_start=0
     std::vector<StreamRecommendationInfo> infos;
     std::set<std::vector<int>> empty_set;
     for (size_t i = 0; i < proc_batch; ++i) {
         infos.push_back(StreamRecommendationInfo(3, 0, 0, false, empty_set, {}, true, 0));
     }
-    // 设置序列 0 处于 combo 末位，有 banned combo [10,20,X] —— 测试 ban 逻辑
-    infos[0].pos_in_combo = 2;
-    infos[0].current_prefix = {1, 2};
-    infos[0].banned_combos.insert({1, 2, 3});
+    // 设置序列 3 处于 combo 末位，有 banned combo [1,2,3] —— 测试 ban 逻辑；
+    // 序列 0/1/2 保持在 diverge layer，用于测试 sequential greedy 分叉。
+    infos[3].pos_in_combo = 2;
+    infos[3].current_prefix = {1, 2};
+    infos[3].banned_combos.insert({1, 2, 3});
 
     auto processor = std::make_shared<RecommendationLogitsProcessor>(infos);
 
@@ -972,16 +1076,18 @@ TEST_F(RecommendationLogitsProcessorTest, testProcessWithNonZeroStartIdx) {
     EXPECT_FLOAT_EQ(10.0f, acc[0][0]);
     EXPECT_FLOAT_EQ(10.0f, acc[1][0]);
 
-    // row 2 (本 processor 的序列 0，主序列): banned combo [1,2,3] 匹配前缀 [1,2]，应将 col 3 置为 -inf
-    EXPECT_FLOAT_EQ(-std::numeric_limits<float>::infinity(), acc[2][3]);
-    // col 0 不受 diverge 影响（主序列不遮蔽）
+    // row 2 (本 processor 的序列 0，主序列): 不受 diverge 影响
     EXPECT_FLOAT_EQ(10.0f, acc[2][0]);
 
-    // row 3 (本 processor 的序列 1): diverge 应遮蔽 top-1 (col 0)
+    // row 3 (本 processor 的序列 1): diverge 应遮蔽主序列选择的 col 0
     EXPECT_FLOAT_EQ(-std::numeric_limits<float>::infinity(), acc[3][0]);
 
-    // row 4 (本 processor 的序列 2): diverge 应遮蔽 top-1,2 (col 0 和次高)
+    // row 4 (本 processor 的序列 2): sequential diverge 应避开 row2/row3 的选择
     EXPECT_FLOAT_EQ(-std::numeric_limits<float>::infinity(), acc[4][0]);
+    EXPECT_FLOAT_EQ(-std::numeric_limits<float>::infinity(), acc[4][1]);
+
+    // row 5 (本 processor 的序列 3): banned combo [1,2,3] 匹配前缀 [1,2]，应将 col 3 置为 -inf
+    EXPECT_FLOAT_EQ(-std::numeric_limits<float>::infinity(), acc[5][3]);
 }
 
 // 场景 25：启用条件真值表 —— SYNC with Python TestCrossLanguageConstantSync::test_enable_conditions_sync

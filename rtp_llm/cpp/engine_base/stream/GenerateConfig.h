@@ -114,8 +114,10 @@ public:
     // 一致前缀，不在去重保证范围内。
     bool enable_cross_sequence_ban = false;
     // 跨序列分叉起始商品位置：前 N 个商品所有序列保持 greedy 一致，
-    // 从第 N+1 个商品开始对非主序列施加 top-K 遮蔽制造分叉。默认 0（立即分叉）。
+    // 从第 N+1 个商品开始对非主序列施加 sequential greedy 分叉。默认 0（立即分叉）。
     int cross_seq_diverge_start_combo = 0;
+    // 跨序列分叉作用的商品内层级（0-indexed），会按 combo_token_size 做 fail-safe clamp。
+    int cross_seq_diverge_layer = 0;
 
     bool top1() {
         return top_k == 1;
@@ -174,7 +176,8 @@ public:
                      << ", unique_key: " << unique_key << ", combo_token_size: " << combo_token_size
                      << ", banned_combo_token_ids_size: " << banned_combo_token_ids.size()
                      << ", enable_cross_sequence_ban: " << enable_cross_sequence_ban
-                     << ", cross_seq_diverge_start_combo: " << cross_seq_diverge_start_combo << "}";
+                     << ", cross_seq_diverge_start_combo: " << cross_seq_diverge_start_combo
+                     << ", cross_seq_diverge_layer: " << cross_seq_diverge_layer << "}";
         return debug_string.str();
     }
 
@@ -291,6 +294,7 @@ public:
         JSONIZE(banned_combo_token_ids);
         JSONIZE(enable_cross_sequence_ban);
         JSONIZE(cross_seq_diverge_start_combo);
+        JSONIZE(cross_seq_diverge_layer);
 #undef JSONIZE
 #undef JSONIZE_OPTIONAL
     }
