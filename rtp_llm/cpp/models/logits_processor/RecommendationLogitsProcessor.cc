@@ -231,24 +231,6 @@ void RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t 
                                             && info.completed_combo_count >= info.cross_seq_diverge_start_combo;
             auto row = logits[i];
 
-            // TEMP DEBUG(diverge-layer0-diagnosis): 打印 mask 前 top-5 原始 logits，用于排查
-            // row2/3/4 类目锁死是「上下文没有正确推进」还是「模型自身在该上下文下收窄」。
-            // 验证结论后必须删除本段日志，不得带入正式版本。
-            if (info.pos_in_combo == 0) {
-                const int64_t topk_n = std::min<int64_t>(5, static_cast<int64_t>(vocab_size));
-                auto topk_result  = torch::topk(row, topk_n);
-                auto topk_values  = std::get<0>(topk_result).to(torch::kCPU);
-                auto topk_indices = std::get<1>(topk_result).to(torch::kCPU);
-                std::string topk_str;
-                for (int64_t k = 0; k < topk_n; ++k) {
-                    topk_str += std::to_string(topk_indices[k].item<int64_t>()) + ":"
-                                + std::to_string(topk_values[k].item<float>()) + " ";
-                }
-                RTP_LLM_LOG_INFO(
-                    "[TEMP DEBUG diverge-diagnosis] row=%zu completed_combo=%d pos=%d top5(id:logit)=%s",
-                    i, info.completed_combo_count, info.pos_in_combo, topk_str.c_str());
-            }
-
             if (qualifies_for_mask && !chosen_tokens.empty()) {
                 const int64_t remaining = torch::isfinite(row).sum().item<int64_t>();
                 std::vector<int64_t> mask_tokens;
