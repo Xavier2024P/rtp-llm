@@ -21,6 +21,8 @@ static_assert(kMaxDivergeDepth == 8,
 
 // cross_seq_diverge_start_combo "过大" 告警阈值，Python 侧 generate_config.py 使用相同值。
 static constexpr int kDivergeStartComboWarnThreshold = 100;
+// 诊断日志只覆盖生成早期，避免线上请求刷屏。Themis/Whale 中搜索 REC_DIVERGE_DIAG。
+static constexpr int kDivergeDiagMaxOutputLen = 64;
 // SYNC: 若修改此值，必须同步更新 Python generate_config.py::_DIVERGE_START_COMBO_WARN_THRESHOLD
 // 以及 test_generate_config_validators.py::test_diverge_start_combo_warn_threshold_sync 中的硬编码期望值。
 static_assert(kDivergeStartComboWarnThreshold == 100,
@@ -110,6 +112,18 @@ RecommendationLogitsProcessor::fromGenerateInput(std::shared_ptr<GenerateInput> 
     const std::vector<int>& end_think_token_ids = config->end_think_token_ids;
 
     auto processor_ptr = std::make_shared<RecommendationLogitsProcessor>();
+    RTP_LLM_LOG_WARNING(
+        "REC_DIVERGE_DIAG create num=%d combo=%d enable_requested=%d enable_effective=%d start_combo=%d "
+        "layer=%d input_len=%d banned_size=%zu eos=%ld",
+        num,
+        config->combo_token_size,
+        static_cast<int>(config->enable_cross_sequence_ban),
+        static_cast<int>(enable_cross_seq_ban),
+        diverge_start_combo,
+        diverge_layer,
+        generate_input->inputLength(),
+        banned_combos.size(),
+        eos_token_id);
     for (int32_t i = 0; i < num; ++i) {
         StreamRecommendationInfo info(config->combo_token_size,
                                       generate_input->inputLength(),
@@ -218,6 +232,25 @@ void RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t 
     // 是否已被禁用 + 剩余合法候选计数）+ 1 次 argmax 同步。生产场景 N 通常 2~4，即使 N 达到
     // kMaxDivergeDepth 上界（8），总同步次数仍是常数级，相比遮空导致的 core 风险，这个代价是可接受的。
     if (need_diverge_process) {
+        const bool diag_enabled = !infos_.empty() && infos_[0].current_output_length < kDivergeDiagMaxOutputLen;
+        if (diag_enabled) {
+            RTP_LLM_LOG_WARNING(
+                "REC_DIVERGE_DIAG enter batch=%zu start_idx=%zu finish_idx=%zu need_ban=%d need_diverge=%d "
+                "out0=%d pos0=%d completed0=%d enable0=%d out1=%d pos1=%d completed1=%d enable1=%d",
+                batch_size,
+                start_idx,
+                finish_idx,
+                static_cast<int>(need_ban_process),
+                static_cast<int>(need_diverge_process),
+                infos_[0].current_output_length,
+                infos_[0].pos_in_combo,
+                infos_[0].completed_combo_count,
+                static_cast<int>(infos_[0].enable_cross_sequence_ban),
+                batch_size > 1 ? infos_[1].current_output_length : -1,
+                batch_size > 1 ? infos_[1].pos_in_combo : -1,
+                batch_size > 1 ? infos_[1].completed_combo_count : -1,
+                batch_size > 1 ? static_cast<int>(infos_[1].enable_cross_sequence_ban) : -1);
+        }
         std::vector<int64_t> chosen_tokens;
         chosen_tokens.reserve(batch_size);
         for (size_t i = 0; i < batch_size; ++i) {
@@ -230,9 +263,14 @@ void RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t 
             const bool qualifies_for_mask = i > 0 && info.enable_cross_sequence_ban && info.think_done
                                             && info.completed_combo_count >= info.cross_seq_diverge_start_combo;
             auto row = logits[i];
+            const int64_t before_argmax = diag_enabled ? row.argmax().item<int64_t>() : -1;
+            int64_t       remaining     = -1;
+            size_t        mask_count    = 0;
+            int64_t       first_mask    = -1;
+            bool          did_mask      = false;
 
             if (qualifies_for_mask && !chosen_tokens.empty()) {
-                const int64_t remaining = torch::isfinite(row).sum().item<int64_t>();
+                remaining = torch::isfinite(row).sum().item<int64_t>();
                 std::vector<int64_t> mask_tokens;
                 mask_tokens.reserve(std::min(static_cast<size_t>(kMaxDivergeDepth), chosen_tokens.size()));
                 for (int64_t tok : chosen_tokens) {
@@ -250,10 +288,34 @@ void RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t 
                         mask_tokens.push_back(tok);
                     }
                 }
+                mask_count = mask_tokens.size();
+                if (!mask_tokens.empty()) {
+                    first_mask = mask_tokens.front();
+                }
                 if (!mask_tokens.empty() && remaining > static_cast<int64_t>(mask_tokens.size())) {
                     auto mask_t = torch::tensor(mask_tokens, torch::kLong).to(logits.device());
                     row.index_put_({mask_t}, -std::numeric_limits<float>::infinity());
+                    did_mask = true;
                 }
+            }
+            if (diag_enabled && at_diverge_layer) {
+                const int64_t after_argmax = row.argmax().item<int64_t>();
+                RTP_LLM_LOG_WARNING(
+                    "REC_DIVERGE_DIAG row=%zu at_layer=%d qualify=%d out=%d pos=%d completed=%d "
+                    "chosen_size=%zu before_argmax=%ld after_argmax=%ld remaining=%ld mask_count=%zu first_mask=%ld did_mask=%d",
+                    i,
+                    static_cast<int>(at_diverge_layer),
+                    static_cast<int>(qualifies_for_mask),
+                    info.current_output_length,
+                    info.pos_in_combo,
+                    info.completed_combo_count,
+                    chosen_tokens.size(),
+                    before_argmax,
+                    after_argmax,
+                    remaining,
+                    mask_count,
+                    first_mask,
+                    static_cast<int>(did_mask));
             }
             // 只有 think 完成的行才贡献 greedy 选择；think 未完成的行生成的是
             // think prelude token，不应作为 combo 分叉的避让依据。
@@ -400,6 +462,15 @@ void RecommendationLogitsProcessor::updateStatus(const torch::Tensor& new_tokens
     // 复杂度：O((N-1) * N * new_combos_per_step)，生产场景 N=2~4、每步最多 1 个 combo 完成，
     // 实际开销可忽略。若未来 N 增大，可将序列 0 的 combo 批量插入后再处理交叉插入，或改用 shared 视图。
     if (any_combo_completed && need_broadcast) {
+        if (!infos_.empty() && infos_[0].current_output_length < kDivergeDiagMaxOutputLen) {
+            RTP_LLM_LOG_WARNING(
+                "REC_DIVERGE_DIAG broadcast any_completed=1 size=%zu out0=%d completed0=%d out1=%d completed1=%d",
+                size(),
+                infos_[0].current_output_length,
+                infos_[0].completed_combo_count,
+                size() > 1 ? infos_[1].current_output_length : -1,
+                size() > 1 ? infos_[1].completed_combo_count : -1);
+        }
         for (size_t i = 1; i < size(); ++i) {
             for (size_t j = 0; j < size(); ++j) {
                 if (j == i) continue;
