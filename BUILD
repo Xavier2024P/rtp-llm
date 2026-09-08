@@ -77,6 +77,28 @@ selects.config_setting_group(
     ],
 )
 
+# sm12x/pro5000 backport: cuda13 config_settings referenced by internal_source
+# arch_select.bzl. This commit predates cuda13; we only build cuda12_9/sm12x, so
+# using_cuda13_x86/using_cuda13_arm always evaluate false and their select()
+# branches are never taken. These declarations only make the internal selects valid.
+config_setting(
+    name = "using_cuda13_x86",
+    values = {"define": "using_cuda13_x86=true"},
+)
+
+config_setting(
+    name = "using_cuda13_arm",
+    values = {"define": "using_cuda13_arm=true"},
+)
+
+selects.config_setting_group(
+    name = "using_cu12_9_or_13_x86",
+    match_any = [
+        ":using_cuda12_9_x86",
+        ":using_cuda13_x86",
+    ],
+)
+
 config_setting(
     name = "xft_use_icx",
     values = {"define": "xft_use_icx=true"},
