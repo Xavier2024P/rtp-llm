@@ -105,27 +105,21 @@ public:
             if (!infos_.empty()) {
                 const auto& existing = infos_[0];
                 const auto& incoming = others->infos_[0];
-                RTP_LLM_CHECK_WITH_INFO(
-                    existing.enable_cross_sequence_ban == incoming.enable_cross_sequence_ban,
-                    "insert: enable_cross_sequence_ban flag mismatch");
-                RTP_LLM_CHECK_WITH_INFO(
-                    existing.combo_token_size == incoming.combo_token_size,
-                    "insert: combo_token_size mismatch");
-                RTP_LLM_CHECK_WITH_INFO(
-                    existing.cross_seq_diverge_start_combo == incoming.cross_seq_diverge_start_combo,
-                    "insert: cross_seq_diverge_start_combo mismatch");
-                RTP_LLM_CHECK_WITH_INFO(
-                    existing.cross_seq_diverge_layer == incoming.cross_seq_diverge_layer,
-                    "insert: cross_seq_diverge_layer mismatch");
-                RTP_LLM_CHECK_WITH_INFO(
-                    existing.needs_token_offset == incoming.needs_token_offset,
-                    "insert: legacy needs_token_offset flag mismatch");
-                RTP_LLM_CHECK_WITH_INFO(
-                    existing.end_think_token_ids == incoming.end_think_token_ids,
-                    "insert: end_think_token_ids mismatch");
-                RTP_LLM_CHECK_WITH_INFO(
-                    existing.eos_token_id == incoming.eos_token_id,
-                    "insert: eos_token_id mismatch");
+                RTP_LLM_CHECK_WITH_INFO(existing.enable_cross_sequence_ban == incoming.enable_cross_sequence_ban,
+                                        "insert: enable_cross_sequence_ban flag mismatch");
+                RTP_LLM_CHECK_WITH_INFO(existing.combo_token_size == incoming.combo_token_size,
+                                        "insert: combo_token_size mismatch");
+                RTP_LLM_CHECK_WITH_INFO(existing.cross_seq_diverge_start_combo
+                                            == incoming.cross_seq_diverge_start_combo,
+                                        "insert: cross_seq_diverge_start_combo mismatch");
+                RTP_LLM_CHECK_WITH_INFO(existing.cross_seq_diverge_layer == incoming.cross_seq_diverge_layer,
+                                        "insert: cross_seq_diverge_layer mismatch");
+                RTP_LLM_CHECK_WITH_INFO(existing.needs_token_offset == incoming.needs_token_offset,
+                                        "insert: legacy needs_token_offset flag mismatch");
+                RTP_LLM_CHECK_WITH_INFO(existing.end_think_token_ids == incoming.end_think_token_ids,
+                                        "insert: end_think_token_ids mismatch");
+                RTP_LLM_CHECK_WITH_INFO(existing.eos_token_id == incoming.eos_token_id,
+                                        "insert: eos_token_id mismatch");
             }
             infos_.insert(infos_.end(), others->infos_.begin(), others->infos_.end());
         }
