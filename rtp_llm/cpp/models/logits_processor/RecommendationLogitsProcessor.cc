@@ -287,6 +287,7 @@ RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t start
             }
         }
     }
+    return std::nullopt;
 }
 
 void RecommendationLogitsProcessor::updateMultiSeqStatus(const std::vector<int>& src_batch_indices) {
