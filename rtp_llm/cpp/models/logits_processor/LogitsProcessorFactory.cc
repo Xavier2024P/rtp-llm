@@ -136,7 +136,9 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
         result.push_back(std::move(tree_processor));
     }
 
-    auto rec_processor = RecommendationLogitsProcessor::fromGenerateInput(generate_input, init_batch_size);
+    // 生成式推荐：combo 粒度去重 + 曝光过滤
+    auto rec_processor =
+        RecommendationLogitsProcessor::fromGenerateInput(generate_input, init_batch_size, eos_token_id);
     if (rec_processor != nullptr) {
         result.push_back(std::move(rec_processor));
     }

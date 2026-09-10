@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/models/logits_processor/RecommendationLogitsProcessor.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <string>
 #include <vector>
@@ -29,7 +30,9 @@ RecommendationLogitsProcessor::RecommendationLogitsProcessor(std::vector<StreamR
     infos_(std::move(infos)) {}
 
 std::shared_ptr<RecommendationLogitsProcessor>
-RecommendationLogitsProcessor::fromGenerateInput(std::shared_ptr<GenerateInput> generate_input, int32_t num) {
+RecommendationLogitsProcessor::fromGenerateInput(std::shared_ptr<GenerateInput> generate_input,
+                                                 int32_t                        num,
+                                                 int64_t                        eos_token_id) {
     const auto& config = generate_input->generate_config;
     if (config->combo_token_size <= 0) {
         return nullptr;
@@ -91,10 +94,21 @@ RecommendationLogitsProcessor::fromGenerateInput(std::shared_ptr<GenerateInput> 
                              "cross_seq_diverge_start_combo is negative (%d), clamped to 0",
                              config->cross_seq_diverge_start_combo);
     } else if (enable_cross_seq_ban && diverge_start_combo > kDivergeStartComboWarnThreshold) {
-        RTP_LLM_INTERVAL_LOG(300,
-                             WARN,
-                             "cross_seq_diverge_start_combo=%d is very large, top-K diverge masking may never activate",
-                             diverge_start_combo);
+        RTP_LLM_INTERVAL_LOG(300, WARN,
+            "cross_seq_diverge_start_combo=%d is very large, sequential diverge may never activate",
+            diverge_start_combo);
+    }
+    int32_t diverge_layer = std::max(0, config->cross_seq_diverge_layer);
+    if (config->cross_seq_diverge_layer < 0) {
+        RTP_LLM_INTERVAL_LOG(300, WARN, "cross_seq_diverge_layer is negative (%d), clamped to 0",
+                            config->cross_seq_diverge_layer);
+    }
+    const int32_t max_diverge_layer = std::max(0, config->combo_token_size - 1);
+    if (diverge_layer > max_diverge_layer) {
+        RTP_LLM_INTERVAL_LOG(300, WARN,
+            "cross_seq_diverge_layer=%d exceeds combo_token_size-1 (%d), clamped to %d",
+            diverge_layer, max_diverge_layer, max_diverge_layer);
+        diverge_layer = max_diverge_layer;
     }
     // 若为空,think_done 初始为 true,Processor 行为等同历史版本(从首个 token 起累 combo)。
     const std::vector<int>& end_think_token_ids = config->end_think_token_ids;
@@ -108,7 +122,9 @@ RecommendationLogitsProcessor::fromGenerateInput(std::shared_ptr<GenerateInput> 
                                       banned_combos,
                                       end_think_token_ids,
                                       enable_cross_seq_ban,
-                                      diverge_start_combo);
+                                      diverge_start_combo,
+                                      diverge_layer,
+                                      eos_token_id);
         processor_ptr->infos_.push_back(std::move(info));
     }
     return processor_ptr;
@@ -125,7 +141,7 @@ RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t start
     // 保证条件：updateMultiSeqStatus 已断言与 cross-seq ban 互斥，此处 batch_size==size()
     // 确认无压缩。若未来引入 intra-stream 子序列管理，需增加显式重排检测。
 
-    // 判断是否需要进行 banned combo 屏蔽或 top-K 分叉遮蔽
+    // 判断是否需要进行 banned combo 屏蔽或 sequential greedy 分叉
     bool need_ban_process     = false;
     bool need_diverge_process = false;
     for (size_t i = 0; i < batch_size; ++i) {
@@ -136,8 +152,9 @@ RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t start
         if (info.pos_in_combo == info.combo_token_size - 1 && !info.banned_combos.empty()) {
             need_ban_process = true;
         }
-        // top-K 分叉：非主序列(i>0) + think完成 + 在 combo 起始位置 + 已达到分叉起始商品 + 开关开启
-        if (i > 0 && info.enable_cross_sequence_ban && info.think_done && info.pos_in_combo == 0
+        // sequential greedy 分叉：非主序列(i>0) + think完成 + 位于配置层级 + 已达到分叉起始商品 + 开关开启
+        if (i > 0 && info.enable_cross_sequence_ban && info.think_done
+            && info.pos_in_combo == info.cross_seq_diverge_layer
             && info.completed_combo_count >= info.cross_seq_diverge_start_combo) {
             need_diverge_process = true;
         }
@@ -149,64 +166,6 @@ RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t start
     auto         logits     = inputs.logits.narrow(0, start_idx, batch_size);
     const size_t vocab_size = logits.size(1);
     RTP_LLM_CHECK_WITH_INFO(vocab_size > 0, "process called with vocab_size=0");
-
-    // --- top-K 分叉遮蔽：对非主序列在 combo 起始位置遮蔽前 i 个最大 logit ---
-    // 设计权衡（deliberate trade-off）：达到 diverge_start_combo 后，每个 combo 起点无条件遮蔽，
-    // 不判断序列是否已与主序列分叉。原因：
-    //   1) "已分叉" 难以定义 —— temperature/top_p 采样下 logits 不同不等于输出不同，
-    //      反之 logits 相同也可能采出不同 token，判断开销高且不可靠；
-    //   2) 遮蔽仅影响 combo 第一位（占生成 token 的 1/combo_token_size），且只剥夺 top-i
-    //      （i 为行号，通常 1~3），对整体质量影响有限；
-    //   3) 三层保护已约束风险：kMaxDivergeDepth 上界、diverge_start_combo 延迟启动、默认关闭。
-    // 若未来观察到高索引序列质量明显下降，可引入基于 banned_combos 差异度的自适应退出。
-    //
-    // 可观测性演进方向（生产侧质量验证）：
-    //   - 每序列平均被遮蔽 token 数（per-step masked_count / active_steps）
-    //   - 分叉命中率（diverge 遮蔽后实际采样到非 top-i 的比例）
-    //   - 高索引序列 combo 完成率 vs 主序列 combo 完成率
-    //   上述指标可通过 kmonitor counter 暴露，为自适应退出策略提供数据支撑。
-    //
-    // 批量化设计决策：对所有非主行做一次 batch topk(max_k)，而非逐行筛选后再 gather/topk/scatter。
-    // 原因：1) 单次 kernel launch 比多次显著更快；2) N=2-4 时几乎所有非主行都符合条件，
-    // 不符合条件的行其 topk 结果不会被使用（下方 for 循环中 skip），无副作用。
-    // trade-off 记录：对不需要 diverge 的行仍做了 topk，但避免了更复杂的条件筛选 + scatter 逻辑，
-    // 在 N<=8 的场景下，多余 topk 计算的开销远小于额外 kernel launch 的开销。
-    if (need_diverge_process) {
-        int max_k = 0;
-        for (size_t i = 1; i < batch_size; ++i) {
-            auto& info = infos_[i];
-            if (info.combo_token_size <= 0 || !info.enable_cross_sequence_ban || !info.think_done)
-                continue;
-            if (info.pos_in_combo != 0 || info.completed_combo_count < info.cross_seq_diverge_start_combo) {
-                continue;
-            }
-            int k = std::min({static_cast<int>(i), static_cast<int>(vocab_size) - 1, kMaxDivergeDepth});
-            if (k > max_k)
-                max_k = k;
-        }
-        if (max_k > 0) {
-            // 防御：确保 topk 的 k 不超过 vocab_size（torch::topk 要求 k <= dim_size）
-            max_k = std::min(max_k, static_cast<int>(vocab_size));
-            // 仅对非主序列(row 1~N-1)做 topk，避免对 row 0 的无效计算
-            auto non_primary_logits = logits.narrow(0, 1, batch_size - 1);
-            auto topk_indices       = std::get<1>(non_primary_logits.topk(max_k, /*dim=*/1));
-            for (size_t i = 1; i < batch_size; ++i) {
-                auto& info = infos_[i];
-                if (info.combo_token_size <= 0 || !info.enable_cross_sequence_ban || !info.think_done)
-                    continue;
-                if (info.pos_in_combo != 0 || info.completed_combo_count < info.cross_seq_diverge_start_combo) {
-                    continue;
-                }
-                // 防御：确保至少保留 1 个可选 token，同时不超过 kMaxDivergeDepth 避免采样退化
-                const int k = std::min({static_cast<int>(i), static_cast<int>(vocab_size) - 1, kMaxDivergeDepth});
-                if (k <= 0)
-                    continue;
-                // 从预计算的 batch topk indices 中裁剪前 k 个位置进行遮蔽
-                // topk_indices 行号 = i-1（因为 narrow 排除了 row 0）
-                logits[i].index_put_({topk_indices[i - 1].slice(0, 0, k)}, BaseLogitsProcessor::neg_inf);
-            }
-        }
-    }
 
     // --- banned combo 屏蔽 ---
     if (need_ban_process) {
@@ -244,7 +203,75 @@ RecommendationLogitsProcessor::process(const SamplerInputs& inputs, size_t start
             logits.index_put_({rows_t, cols_t}, BaseLogitsProcessor::neg_inf);
         }
     }
-    return std::nullopt;
+
+    // --- sequential greedy 分叉：合法性优先，绝不遮空唯一合法候选 ---
+    // 设计取代原 blind top-K masking 的原因：Tree/Prefix/SID 等前置约束可能已把某位置的
+    // 合法候选压得很窄（甚至只剩 1 个），盲目遮蔽固定的 top-i 会把唯一合法候选置为 -inf，
+    // 导致该行采样退化为纯噪声甚至触发下游 core。
+    //
+    // 新算法（按行序模拟 greedy 选择）：
+    //   1) 按行号从 0 递增处理；每行处理前，chosen_tokens 保存了此前所有
+    //      「位于同一 cross_seq_diverge_layer」行各自最终选定的贪心 token。
+    //   2) 若当前行 qualifies（i>0、think 完成、位于 diverge_layer、已过 diverge_start_combo），
+    //      依次收集 chosen_tokens 中仍属于本行合法候选的 token（上限 kMaxDivergeDepth 个）；
+    //      只有当遮蔽后仍至少保留 1 个有限 logit 时才整体遮蔽，否则整行回退为不 mask。
+    //   3) 遮蔽完成后，取本行当前 argmax 作为「贪心选择」结果，加入 chosen_tokens 供后续行参考。
+    //   4) 非 diverge_layer 的行不参与、不贡献 chosen_tokens（其 pos_in_combo 与 diverge_layer
+    //      不一致，语义上不是同一层级的候选，不应互相干扰）。
+    //
+    // 性能权衡：每个 qualifying 行需要 O(min(i, kMaxDivergeDepth)) 次 GPU→CPU 同步（逐 token 检查
+    // 是否已被禁用 + 剩余合法候选计数）+ 1 次 argmax 同步。生产场景 N 通常 2~4，即使 N 达到
+    // kMaxDivergeDepth 上界（8），总同步次数仍是常数级，相比遮空导致的 core 风险，这个代价是可接受的。
+    if (need_diverge_process) {
+        std::vector<int64_t> chosen_tokens;
+        chosen_tokens.reserve(batch_size);
+        for (size_t i = 0; i < batch_size; ++i) {
+            auto&      info = infos_[i];
+            const bool at_diverge_layer =
+                info.combo_token_size > 0 && info.pos_in_combo == info.cross_seq_diverge_layer;
+            if (!at_diverge_layer) {
+                continue;
+            }
+            const bool qualifies_for_mask = i > 0 && info.enable_cross_sequence_ban && info.think_done
+                                            && info.completed_combo_count >= info.cross_seq_diverge_start_combo;
+            auto row = logits[i];
+
+            if (qualifies_for_mask && !chosen_tokens.empty()) {
+                const int64_t remaining = torch::isfinite(row).sum().item<int64_t>();
+                std::vector<int64_t> mask_tokens;
+                mask_tokens.reserve(std::min(static_cast<size_t>(kMaxDivergeDepth), chosen_tokens.size()));
+                for (int64_t tok : chosen_tokens) {
+                    if (mask_tokens.size() >= static_cast<size_t>(kMaxDivergeDepth)) {
+                        break;
+                    }
+                    if (tok < 0 || static_cast<size_t>(tok) >= vocab_size) {
+                        continue;
+                    }
+                    if (std::find(mask_tokens.begin(), mask_tokens.end(), tok) != mask_tokens.end()) {
+                        continue;
+                    }
+                    const float cur_val = row[tok].item<float>();
+                    if (std::isfinite(cur_val)) {
+                        mask_tokens.push_back(tok);
+                    }
+                }
+                if (!mask_tokens.empty() && remaining > static_cast<int64_t>(mask_tokens.size())) {
+                    auto mask_t = torch::tensor(mask_tokens, torch::kLong).to(logits.device());
+                    row.index_put_({mask_t}, -std::numeric_limits<float>::infinity());
+                }
+            }
+            // 只有 think 完成的行才贡献 greedy 选择；think 未完成的行生成的是
+            // think prelude token，不应作为 combo 分叉的避让依据。
+            // 显式排除 EOS：EOS 不应作为「需要被后续行避让」的候选，否则会导致
+            // 主序列贪心选中 EOS 时，后续序列在应停止的位置被误遮蔽 EOS，无法正常结束生成。
+            if (info.think_done) {
+                const int64_t greedy_tok = row.argmax().item<int64_t>();
+                if (!(info.eos_token_id >= 0 && greedy_tok == info.eos_token_id)) {
+                    chosen_tokens.push_back(greedy_tok);
+                }
+            }
+        }
+    }
 }
 
 void RecommendationLogitsProcessor::updateMultiSeqStatus(const std::vector<int>& src_batch_indices) {
@@ -340,10 +367,11 @@ std::optional<ErrorInfo> RecommendationLogitsProcessor::updateStatus(const torch
         }
 
         const int64_t stride = new_tokens.size(1);
-        RTP_LLM_CHECK_WITH_INFO(stride >= num_new_tokens,
-                                "updateStatus token shape mismatch: num_new_tokens=%d, new_tokens.size(1)=%ld",
-                                num_new_tokens,
-                                stride);
+        RTP_LLM_CHECK_WITH_INFO(
+            stride >= num_new_tokens,
+            "updateStatus token shape mismatch: num_new_tokens=%d, new_tokens.size(1)=%ld",
+            num_new_tokens,
+            stride);
 
         // Recommendation processor accepts two token layouts from GenerateStream::update:
         // 1) incremental tokens: [batch, num_new_tokens], used by non-beam sampling and n>1 returns;

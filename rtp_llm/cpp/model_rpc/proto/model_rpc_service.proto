@@ -141,6 +141,8 @@ message GenerateConfigPB {
     bool enable_cross_sequence_ban = 61;
     // 跨序列分叉起始商品位置
     int32 cross_seq_diverge_start_combo = 62;
+    // 跨序列分叉作用的商品内层级（0-indexed）
+    int32 cross_seq_diverge_layer = 74;
     bool return_prompt_logits = 63;
     int32 prompt_logits_top_k = 64;
     int32 prompt_logits_start = 65;

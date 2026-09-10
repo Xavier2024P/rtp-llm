@@ -163,8 +163,11 @@ class GenerateConfig(BaseModel):
     # 后续 update()/update_and_pop() 补齐条件后会自动重新启用（仅限曾被自动降级的情况）。
     enable_cross_sequence_ban: bool = False
     # 跨序列分叉起始商品位置：前 N 个商品所有序列保持 greedy 一致，
-    # 从第 N+1 个商品开始对非主序列施加 top-K 遮蔽制造分叉。默认 0（立即分叉）。
+    # 从第 N+1 个商品开始对非主序列施加 sequential greedy 分叉。默认 0（立即分叉）。
     cross_seq_diverge_start_combo: int = 0
+    # 跨序列分叉作用的商品内层级（0-indexed）：默认 0 表示在每个商品第一层语义 ID 分叉。
+    # 取值会按 combo_token_size 做 fail-safe clamp，避免非法层级影响线上请求。
+    cross_seq_diverge_layer: int = 0
 
     random_seed: Optional[Union[List[int], int]] = None
     top_p_decay: Optional[Union[List[float], float]] = None
@@ -335,6 +338,69 @@ class GenerateConfig(BaseModel):
         """构造路径入口：委托给 _sanitize_diverge_start_combo。"""
         return cls._sanitize_diverge_start_combo(v)
 
+    @staticmethod
+    def _sanitize_diverge_layer(v: "int | str | None") -> int:
+        """将 cross_seq_diverge_layer 规范化为非负 int32 范围内的整数。"""
+        global _last_sanitize_warn_time
+        _INT32_MAX = 2**31 - 1
+        if v is None:
+            return 0
+        try:
+            val = int(v)
+        except (TypeError, ValueError) as e:
+            now = time.monotonic()
+            if now - _last_sanitize_warn_time >= _SANITIZE_WARN_INTERVAL:
+                logging.getLogger(__name__).warning(
+                    "cross_seq_diverge_layer received non-integer value %r, defaulting to 0: %s",
+                    v,
+                    e,
+                )
+                _last_sanitize_warn_time = now
+            return 0
+        if val < 0:
+            now = time.monotonic()
+            if now - _last_sanitize_warn_time >= _SANITIZE_WARN_INTERVAL:
+                logging.getLogger(__name__).warning(
+                    "cross_seq_diverge_layer is negative (%d), clamped to 0", val
+                )
+                _last_sanitize_warn_time = now
+            return 0
+        if val > _INT32_MAX:
+            now = time.monotonic()
+            if now - _last_sanitize_warn_time >= _SANITIZE_WARN_INTERVAL:
+                logging.getLogger(__name__).warning(
+                    "cross_seq_diverge_layer exceeds int32 max (%d), clamped to %d",
+                    val,
+                    _INT32_MAX,
+                )
+                _last_sanitize_warn_time = now
+            return _INT32_MAX
+        return val
+
+    @field_validator("cross_seq_diverge_layer", mode="before")
+    @classmethod
+    def _clamp_diverge_layer(cls, v):
+        """构造路径入口：先做类型/下界兜底，上界依赖 combo_token_size 在 model_validator 中处理。"""
+        return cls._sanitize_diverge_layer(v)
+
+    def _clamp_diverge_layer_to_combo_size(self):
+        """将 cross_seq_diverge_layer 钳制到当前 combo_token_size 对应的合法层级。"""
+        if self.combo_token_size <= 0:
+            return
+        max_layer = self.combo_token_size - 1
+        if self.cross_seq_diverge_layer > max_layer:
+            global _last_sanitize_warn_time
+            now = time.monotonic()
+            if now - _last_sanitize_warn_time >= _SANITIZE_WARN_INTERVAL:
+                logging.getLogger(__name__).warning(
+                    "cross_seq_diverge_layer=%d exceeds combo_token_size-1 (%d), clamped to %d",
+                    self.cross_seq_diverge_layer,
+                    max_layer,
+                    max_layer,
+                )
+                _last_sanitize_warn_time = now
+            self.cross_seq_diverge_layer = max_layer
+
     @model_validator(mode="after")
     def _check_cross_seq_ban_compatibility(self):
         """cross_sequence_ban 与多项配置不兼容时直接禁用，一次性报告所有不兼容原因。
@@ -347,6 +413,7 @@ class GenerateConfig(BaseModel):
           - C++ 侧使用 INTERVAL_LOG(300) 是因为 fromGenerateInput 在高 QPS 下可能
             对同一配置反复调用，属不同场景。
         """
+        self._clamp_diverge_layer_to_combo_size()
         if not self.enable_cross_sequence_ban:
             # “先建后补”场景补救：若特性曾被自动降级且当前条件已全部满足，重新启用并继续校验。
             # 解决 request_extractor 两次 update_and_pop 分步合并导致的误降级问题。
@@ -415,7 +482,7 @@ class GenerateConfig(BaseModel):
             and self.cross_seq_diverge_start_combo > _DIVERGE_START_COMBO_WARN_THRESHOLD
         ):
             logging.getLogger(__name__).warning(
-                "cross_seq_diverge_start_combo=%d is very large, top-K diverge masking may never activate",
+                "cross_seq_diverge_start_combo=%d is very large, sequential diverge may never activate",
                 self.cross_seq_diverge_start_combo,
             )
         return self
@@ -517,11 +584,17 @@ class GenerateConfig(BaseModel):
             if hasattr(self, key):
                 setattr(self, key, self._parse_update_value(key, value))
         # setattr 不会触发 field_validator / model_validator，手动补偿：
-        # 1) cross_seq_diverge_start_combo 的 clamp/类型兜底
+        # 1) cross_seq_diverge_start_combo / cross_seq_diverge_layer 的 clamp/类型兜底
         if "cross_seq_diverge_start_combo" in new:
             self.cross_seq_diverge_start_combo = self._sanitize_diverge_start_combo(
                 self.cross_seq_diverge_start_combo
             )
+        if "cross_seq_diverge_layer" in new:
+            self.cross_seq_diverge_layer = self._sanitize_diverge_layer(
+                self.cross_seq_diverge_layer
+            )
+        if "cross_seq_diverge_layer" in new or "combo_token_size" in new:
+            self._clamp_diverge_layer_to_combo_size()
         # 2) 若 num_return_sequences 变化，重置深度告警标志以允许重新检测
         if "num_return_sequences" in new:
             self._diverge_depth_warned = False
@@ -545,6 +618,12 @@ class GenerateConfig(BaseModel):
             self.cross_seq_diverge_start_combo = self._sanitize_diverge_start_combo(
                 self.cross_seq_diverge_start_combo
             )
+        if "cross_seq_diverge_layer" in new:
+            self.cross_seq_diverge_layer = self._sanitize_diverge_layer(
+                self.cross_seq_diverge_layer
+            )
+        if "cross_seq_diverge_layer" in new or "combo_token_size" in new:
+            self._clamp_diverge_layer_to_combo_size()
         if "num_return_sequences" in new:
             self._diverge_depth_warned = False
         if "enable_cross_sequence_ban" in new:
