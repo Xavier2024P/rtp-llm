@@ -87,6 +87,21 @@ RecommendationLogitsProcessor::fromGenerateInput(std::shared_ptr<GenerateInput> 
                              num,
                              kMaxDivergeDepth);
     }
+    // sequential greedy 分叉在 process() 中用 argmax 预测各行「将会选中」的 token，而 process()
+    // 早于 Sampler 的取词步骤执行，无法得知实际取词结果。只有取词等价于 argmax（do_sample=false
+    // 或 top_k=1）时该预测才必然成立；随机采样下实际取词可能偏离 argmax，遮蔽会落在错误的候选
+    // 上，跨序列去重退化为 best-effort（既可能白遮，也可能漏遮导致序列间重复商品）。
+    if (enable_cross_seq_ban && config->stochastic()) {
+        RTP_LLM_INTERVAL_LOG(300,
+                             WARN,
+                             "cross_sequence_ban assumes greedy decoding, but stochastic sampling is enabled "
+                             "(do_sample=%d top_k=%d top_p=%f temperature=%f): sampled token may differ from the "
+                             "argmax used for diverge masking, cross-sequence dedup becomes best-effort",
+                             static_cast<int>(config->do_sample),
+                             config->top_k,
+                             config->top_p,
+                             config->temperature);
+    }
     const int32_t diverge_start_combo = std::max(0, config->cross_seq_diverge_start_combo);
     if (config->cross_seq_diverge_start_combo < 0) {
         RTP_LLM_INTERVAL_LOG(300,
