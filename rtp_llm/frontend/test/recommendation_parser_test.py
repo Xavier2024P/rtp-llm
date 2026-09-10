@@ -6,6 +6,8 @@
 3. 正常解析并填充（含 pos 不连续场景）
 4. 已有 banned_combo_token_ids 与解析结果合并去重
 5. auto-fill end_think_token_ids 的白名单/覆盖/encode 异常/空 banned 时不触发
+6. banned_combo_semantic_ids 直传语义 ID 串：生效、优先于 prompt、段数不符跳过、去重合并、裸字符串忽略
+7. 回归防护：auto_parse=False 的两条路径（直传语义 ID / 预置 banned）仍触发 auto-fill
 """
 
 import unittest
@@ -42,11 +44,13 @@ def _make_config(
     auto_parse: bool,
     combo_token_size: int,
     banned: Optional[List[List[int]]] = None,
+    semantic_ids: Optional[List[str]] = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         auto_parse_banned_combo=auto_parse,
         combo_token_size=combo_token_size,
         banned_combo_token_ids=list(banned) if banned else [],
+        banned_combo_semantic_ids=list(semantic_ids) if semantic_ids else [],
     )
 
 
@@ -117,6 +121,91 @@ class RecommendationParserTest(unittest.TestCase):
         parse_and_fill_banned_combo("plain prompt without pos patterns", cfg, tok)
         self.assertEqual([], cfg.banned_combo_token_ids)
         self.assertIsNone(getattr(cfg, "end_think_token_ids", None))
+
+    def test_semantic_ids_fill(self):
+        """显式传语义 ID 串时直接编码填充，不依赖 prompt。"""
+        cfg = _make_config(
+            auto_parse=False,
+            combo_token_size=3,
+            semantic_ids=["C522C3421C4126", "C100C200C300"],
+        )
+        n = parse_and_fill_banned_combo("", cfg, FakeTokenizer())
+        self.assertEqual(2, n)
+        self.assertIn([10522, 13421, 14126], cfg.banned_combo_token_ids)
+        self.assertIn([10100, 10200, 10300], cfg.banned_combo_token_ids)
+
+    def test_semantic_ids_take_priority_over_prompt(self):
+        """新字段非空时完全跳过 prompt 解析，即使 auto_parse 也开着。"""
+        cfg = _make_config(
+            auto_parse=True,
+            combo_token_size=3,
+            semantic_ids=["C522C3421C4126"],
+        )
+        n = parse_and_fill_banned_combo(self.PROMPT, cfg, FakeTokenizer())
+        self.assertEqual(1, n)
+        self.assertEqual([[10522, 13421, 14126]], cfg.banned_combo_token_ids)
+        # prompt 里的 pos0 商品不应被解析进来
+        self.assertNotIn([11071, 12997, 14163], cfg.banned_combo_token_ids)
+
+    def test_semantic_ids_skip_wrong_segment_count(self):
+        """段数与 combo_token_size 不符的项被跳过，其余项照常生效。"""
+        cfg = _make_config(
+            auto_parse=False,
+            combo_token_size=3,
+            semantic_ids=["C522C3421", "C100C200C300", "C1C2C3C4"],
+        )
+        n = parse_and_fill_banned_combo("", cfg, FakeTokenizer())
+        self.assertEqual(1, n)
+        self.assertEqual([[10100, 10200, 10300]], cfg.banned_combo_token_ids)
+
+    def test_semantic_ids_bare_string_ignored(self):
+        """鸭子类型入参下裸字符串被整体忽略，不会按字符遍历成垃圾 combo。"""
+        cfg = _make_config(auto_parse=False, combo_token_size=3)
+        cfg.banned_combo_semantic_ids = "C522C3421C4126"
+        n = parse_and_fill_banned_combo("", cfg, FakeTokenizer())
+        self.assertEqual(0, n)
+        self.assertEqual([], cfg.banned_combo_token_ids)
+
+    def test_semantic_ids_merge_with_existing_dedup(self):
+        """新字段结果与已有 banned_combo_token_ids 去重合并。"""
+        cfg = _make_config(
+            auto_parse=False,
+            combo_token_size=3,
+            banned=[[10522, 13421, 14126]],
+            semantic_ids=["C522C3421C4126", "C100C200C300"],
+        )
+        n = parse_and_fill_banned_combo("", cfg, FakeTokenizer())
+        self.assertEqual(1, n)
+        self.assertEqual(2, len(cfg.banned_combo_token_ids))
+
+    def test_auto_fill_triggered_on_semantic_ids_path(self):
+        """回归防护：走新字段路径（auto_parse=False）时 end_think_token_ids 仍被填充。
+
+        重构前 auto_parse=False 会在函数入口直接 return，导致 auto-fill 永不执行，
+        Processor 从 think prelude 起累 combo 前缀，曝光过滤静默失效。
+        """
+        tok = FakeTokenizer()
+        tok.name_or_path = "qwen3/fake"
+        cfg = _make_config(
+            auto_parse=False,
+            combo_token_size=3,
+            semantic_ids=["C522C3421C4126"],
+        )
+        parse_and_fill_banned_combo("", cfg, tok)
+        self.assertEqual([1001, 1002, 1003, 1004], cfg.end_think_token_ids)
+
+    def test_auto_fill_triggered_on_preset_banned_combo(self):
+        """回归防护：调用方直接预置 banned_combo_token_ids 时也应填充 end_think_token_ids。"""
+        tok = FakeTokenizer()
+        tok.name_or_path = "qwen3/fake"
+        cfg = _make_config(
+            auto_parse=False,
+            combo_token_size=3,
+            banned=[[10522, 13421, 14126]],
+        )
+        n = parse_and_fill_banned_combo("", cfg, tok)
+        self.assertEqual(0, n)
+        self.assertEqual([1001, 1002, 1003, 1004], cfg.end_think_token_ids)
 
 
 if __name__ == "__main__":

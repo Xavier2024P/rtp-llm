@@ -1,14 +1,19 @@
-"""生成式推荐场景:从 prompt 中解析「已推荐曝光的商品序列」并构造 banned_combo_token_ids。
+"""生成式推荐场景:构造 banned_combo_token_ids(禁止生成的商品 token 组合)。
 
-典型 prompt 片段(格式严格):
-    已推荐曝光的商品序列和位置:pos0:C1071C2997C4163,pos1:C741C3248C4162,...
+曝光商品的来源有两种,按优先级二选一:
+  1. generate_config.banned_combo_semantic_ids:调用方直接给出的原始语义 ID 串
+     (每项形如 "C522C3421C4126")。非空时完全跳过 prompt 解析。
+  2. generate_config.auto_parse_banned_combo=True:从 prompt 正则抽取,格式严格:
+     已推荐曝光的商品序列和位置:pos0:C1071C2997C4163,pos1:C741C3248C4162,...
 
-本模块只在 generate_config.auto_parse_banned_combo=True 且 combo_token_size>0
-时被 pipeline 调用;对非推荐场景零侵入。
+两者都未提供时本模块不追加任何 combo,对非推荐场景零侵入。
 
 附加:对 qwen3 等默认输出 think 占位 token 的模型,若用户未显式设置
 end_think_token_ids,这里会自动用 tokenizer 编码默认 prelude 并填入 generate_config,
 使得 C++ 侧 RecommendationLogitsProcessor 能跳过 prelude 再开始累 combo 前缀。
+该填充只要最终存在 banned_combo 就会执行,不依赖本次是否新增了 combo,
+也不依赖商品来源——否则调用方直接传 banned_combo_token_ids 时会因 prelude
+未被跳过而静默错位,曝光过滤彻底失效且无任何报错。
 """
 
 import logging
@@ -120,27 +125,87 @@ def _auto_fill_end_think_prelude(generate_config: Any, tokenizer: Any) -> None:
     )
 
 
+def _split_semantic_id_str(
+    semantic_str: str,
+    combo_token_size: int,
+) -> Optional[List[str]]:
+    """把单个商品的语义 ID 串(如 "C522C3421C4126")切成 combo_token_size 个语义 ID。
+
+    段数不符视为调用方入参错误,warning 后返回 None 让调用侧跳过该商品,
+    而不是让整个请求失败——与 prompt 解析路径的容错粒度保持一致。
+    """
+    semantic_ids = _SEMANTIC_ID_RE.findall(semantic_str)
+    if len(semantic_ids) != combo_token_size:
+        logging.warning(
+            "recommendation_parser: skip banned_combo_semantic_ids item '%s' since its "
+            "semantic id count %d != combo_token_size %d",
+            semantic_str,
+            len(semantic_ids),
+            combo_token_size,
+        )
+        return None
+    return semantic_ids
+
+
+def _collect_exposed_items(
+    prompt: str,
+    generate_config: Any,
+    combo_token_size: int,
+) -> List[List[str]]:
+    """按优先级收集待禁止的商品语义 ID 组合。
+
+    banned_combo_semantic_ids 非空时完全跳过 prompt 解析:调用方既然显式给出了
+    曝光列表,就不应再受 prompt 文本格式影响。两者都未提供时返回空列表。
+
+    本函数以 getattr 鸭子类型读取 config,不假设一定经过 GenerateConfig 的校验,
+    因此对非 list/tuple 入参再兜一次——裸字符串会被按字符遍历成垃圾 combo。
+    """
+    explicit = getattr(generate_config, "banned_combo_semantic_ids", None)
+    if explicit and not isinstance(explicit, (list, tuple)):
+        logging.warning(
+            "recommendation_parser: banned_combo_semantic_ids expects a list of str, got %s, ignored",
+            type(explicit).__name__,
+        )
+        explicit = None
+    if explicit:
+        items: List[List[str]] = []
+        for semantic_str in explicit:
+            semantic_ids = _split_semantic_id_str(semantic_str, combo_token_size)
+            if semantic_ids is not None:
+                items.append(semantic_ids)
+        return items
+
+    if getattr(generate_config, "auto_parse_banned_combo", False) and prompt:
+        return _extract_exposed_items(prompt, combo_token_size)
+
+    return []
+
+
 def parse_and_fill_banned_combo(
     prompt: str,
     generate_config: Any,
     tokenizer: Any,
 ) -> int:
-    """解析 prompt 中的已曝光商品并合并到 generate_config.banned_combo_token_ids。
+    """收集曝光商品并合并到 generate_config.banned_combo_token_ids。
 
-    只有 generate_config.auto_parse_banned_combo=True 且 combo_token_size>0 时才会执行。
-    已有的 banned_combo_token_ids 会被保留,通过 set 去重合并新解析出的组合。
-    当确定启用了推荐约束(存在可用的 banned_combo)时,会顺带自动填充 end_think_token_ids,
-    用于 C++ Processor 跳过模型默认输出的 think prelude。
+    商品来源见模块 docstring:banned_combo_semantic_ids 优先,其次是
+    auto_parse_banned_combo 从 prompt 解析。已有的 banned_combo_token_ids 会被保留,
+    通过 set 去重合并新收集到的组合。
+
+    只要最终存在 banned_combo,就会自动填充 end_think_token_ids,用于 C++ Processor
+    跳过模型默认输出的 think prelude。这一步不能被「本次无新增」短路,否则
+    调用方直接传 banned_combo_token_ids 或 banned_combo_semantic_ids 的路径上,
+    prelude 不被跳过会导致 combo 前缀静默错位、曝光过滤完全不生效。
+
     返回本次追加的商品数量(用于日志/监控)。
     """
     combo_token_size = getattr(generate_config, "combo_token_size", 0)
-    auto_parse = getattr(generate_config, "auto_parse_banned_combo", False)
-    if not auto_parse or combo_token_size <= 0 or tokenizer is None or not prompt:
+    if combo_token_size <= 0 or tokenizer is None:
+        return 0
+    if getattr(generate_config, "banned_combo_token_ids", None) is None:
         return 0
 
-    exposed_items = _extract_exposed_items(prompt, combo_token_size)
-    if not exposed_items:
-        return 0
+    exposed_items = _collect_exposed_items(prompt, generate_config, combo_token_size)
 
     existing = {tuple(combo) for combo in generate_config.banned_combo_token_ids}
     appended = 0
@@ -169,12 +234,14 @@ def parse_and_fill_banned_combo(
 
     if appended > 0:
         logging.info(
-            "recommendation_parser: parsed %d exposed items from prompt, total banned_combo=%d",
+            "recommendation_parser: collected %d exposed items, total banned_combo=%d",
             appended,
             len(generate_config.banned_combo_token_ids),
         )
 
-    # 仅当真正启用推荐约束(有 banned_combo)时,才需要 Processor 跳过 think prelude
+    # 仅当真正启用推荐约束(有 banned_combo)时,才需要 Processor 跳过 think prelude。
+    # 此处故意不看 appended:调用方可能本次未新增任何 combo(全重复)或直接预置了
+    # banned_combo_token_ids,这些场景同样需要跳过 prelude。
     if generate_config.banned_combo_token_ids:
         _auto_fill_end_think_prelude(generate_config, tokenizer)
 

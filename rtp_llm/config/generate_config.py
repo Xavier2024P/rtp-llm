@@ -168,6 +168,10 @@ class GenerateConfig(BaseModel):
     # 跨序列分叉作用的商品内层级（0-indexed）：默认 0 表示在每个商品第一层语义 ID 分叉。
     # 取值会按 combo_token_size 做 fail-safe clamp，避免非法层级影响线上请求。
     cross_seq_diverge_layer: int = 0
+    # 曝光商品的原始语义 ID 串，每项形如 "C522C3421C4126"，段数须等于 combo_token_size。
+    # 非空时优先于 auto_parse_banned_combo：跳过 prompt 正则解析，直接编码本字段填充
+    # banned_combo_token_ids，使调用方无需自行 tokenize、也不依赖 prompt 文本格式。
+    banned_combo_semantic_ids: List[str] = []
 
     random_seed: Optional[Union[List[int], int]] = None
     top_p_decay: Optional[Union[List[float], float]] = None
@@ -383,6 +387,53 @@ class GenerateConfig(BaseModel):
         """构造路径入口：先做类型/下界兜底，上界依赖 combo_token_size 在 model_validator 中处理。"""
         return cls._sanitize_diverge_layer(v)
 
+    @staticmethod
+    def _sanitize_banned_combo_semantic_ids(v: Any) -> List[str]:
+        """将 banned_combo_semantic_ids 规范化为保序去重的非空字符串列表。
+
+        非 list/tuple 入参整体丢弃；非字符串项逐项丢弃并限流告警；空白项与重复项
+        静默丢弃（无害且调用方常见）。非法入参一律降级为「本字段不生效」而不是让
+        请求失败，与本类其他 sanitize 行为保持一致。
+        """
+        global _last_sanitize_warn_time
+        if v is None:
+            return []
+        if not isinstance(v, (list, tuple)):
+            now = time.monotonic()
+            if now - _last_sanitize_warn_time >= _SANITIZE_WARN_INTERVAL:
+                logging.getLogger(__name__).warning(
+                    "banned_combo_semantic_ids expects a list of str, got %s, ignored",
+                    type(v).__name__,
+                )
+                _last_sanitize_warn_time = now
+            return []
+        cleaned: List[str] = []
+        seen = set()
+        dropped = 0
+        for item in v:
+            if not isinstance(item, str):
+                dropped += 1
+                continue
+            sid = item.strip()
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            cleaned.append(sid)
+        if dropped:
+            now = time.monotonic()
+            if now - _last_sanitize_warn_time >= _SANITIZE_WARN_INTERVAL:
+                logging.getLogger(__name__).warning(
+                    "banned_combo_semantic_ids dropped %d non-str item(s)", dropped
+                )
+                _last_sanitize_warn_time = now
+        return cleaned
+
+    @field_validator("banned_combo_semantic_ids", mode="before")
+    @classmethod
+    def _clean_banned_combo_semantic_ids(cls, v):
+        """构造路径入口：委托给 _sanitize_banned_combo_semantic_ids。"""
+        return cls._sanitize_banned_combo_semantic_ids(v)
+
     def _clamp_diverge_layer_to_combo_size(self):
         """将 cross_seq_diverge_layer 钳制到当前 combo_token_size 对应的合法层级。"""
         if self.combo_token_size <= 0:
@@ -595,6 +646,10 @@ class GenerateConfig(BaseModel):
             )
         if "cross_seq_diverge_layer" in new or "combo_token_size" in new:
             self._clamp_diverge_layer_to_combo_size()
+        if "banned_combo_semantic_ids" in new:
+            self.banned_combo_semantic_ids = self._sanitize_banned_combo_semantic_ids(
+                self.banned_combo_semantic_ids
+            )
         # 2) 若 num_return_sequences 变化，重置深度告警标志以允许重新检测
         if "num_return_sequences" in new:
             self._diverge_depth_warned = False
@@ -624,6 +679,10 @@ class GenerateConfig(BaseModel):
             )
         if "cross_seq_diverge_layer" in new or "combo_token_size" in new:
             self._clamp_diverge_layer_to_combo_size()
+        if "banned_combo_semantic_ids" in new:
+            self.banned_combo_semantic_ids = self._sanitize_banned_combo_semantic_ids(
+                self.banned_combo_semantic_ids
+            )
         if "num_return_sequences" in new:
             self._diverge_depth_warned = False
         if "enable_cross_sequence_ban" in new:
