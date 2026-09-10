@@ -57,6 +57,7 @@ normal_profiler*.json
 core-*
 
 .specstory
+.qoder/
 
 # Debug and build output files
 out
